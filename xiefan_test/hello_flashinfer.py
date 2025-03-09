@@ -16,7 +16,6 @@ q = torch.randn(num_qo_heads, head_dim).half().to(0)
 o = flashinfer.single_decode_with_kv_cache(q, k, v) # decode attention without RoPE on-the-fly
 o_rope_on_the_fly = flashinfer.single_decode_with_kv_cache(q, k, v, pos_encoding_mode="ROPE_LLAMA") # decode with LLaMA style RoPE on-the-fly
 
-print(f"o_rope_on_the_fly: {o_rope_on_the_fly}")
 
 # append attention
 append_qo_len = 128
