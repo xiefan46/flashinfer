@@ -73,12 +73,12 @@ def moe_swiglu_fp8_requant(
     scale_expanded = scale_transposed.repeat_interleave(BLOCK, dim=1)  # [padded, 2*I]
     x_f32 = x_fp8_f32 * scale_expanded  # [padded, 2*I]
 
-    # Split gate and up projections
+    # Split gate and up projections (DeepSeek convention: silu on second half)
     gate = x_f32[:, :I]  # [padded, I]
     up = x_f32[:, I:]  # [padded, I]
 
-    # SwiGLU: silu(gate) * up
-    y = torch.nn.functional.silu(gate) * up  # [padded, I]
+    # SwiGLU: silu(up) * gate (DeepSeek-V3: silu applied to second half)
+    y = torch.nn.functional.silu(up) * gate  # [padded, I]
 
     # Per-128-block FP8 requantization
     y_blocks = y.reshape(padded, num_out_blocks, BLOCK)  # [padded, num_out_blocks, BLOCK]
@@ -118,10 +118,10 @@ def moe_swiglu_fp8_requant_reference(
     scale_expanded = scale_transposed.repeat_interleave(BLOCK, dim=1)  # [padded, 2*I]
     x_f32 = x_fp8_f32 * scale_expanded
 
-    # SwiGLU
+    # SwiGLU (DeepSeek-V3: silu on second half)
     gate = x_f32[:, :I]
     up = x_f32[:, I:]
-    y_f32 = torch.nn.functional.silu(gate) * up
+    y_f32 = torch.nn.functional.silu(up) * gate
 
     # Requant
     act_out, act_scale = moe_swiglu_fp8_requant(gemm1_out, gemm1_scale)
