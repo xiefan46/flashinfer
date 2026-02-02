@@ -67,6 +67,9 @@ def test_pipeline_vs_reference(seq_len, intermediate_size):
         device=device,
     )
 
+    # Bias routing logits toward local experts so tokens actually get routed here
+    inputs["routing_logits"][:, local_expert_offset:local_expert_offset + E_LOCAL] += 5.0
+
     # Run reference
     ref_out = run_fp8_block_scale_moe_reference(
         routing_logits=inputs["routing_logits"],
@@ -127,12 +130,19 @@ def test_pipeline_vs_reference(seq_len, intermediate_size):
         ref_f32.flatten(), cute_f32.flatten(), dim=0
     ).item()
 
+    # Ensure outputs are not all zeros (i.e., tokens were actually routed)
+    ref_nonzero = ref_f32.abs().max().item()
+    cute_nonzero = cute_f32.abs().max().item()
+
     print(f"\nseq_len={seq_len}, I={I}")
+    print(f"  Ref max: {ref_nonzero:.6e}, Cute max: {cute_nonzero:.6e}")
     print(f"  Hit ratio: {hit_ratio*100:.2f}% (need >= {percent*100:.2f}%)")
     print(f"  Cosine sim: {cos_sim:.6f}")
     print(f"  Max abs diff: {left.max():.6e}")
     print(f"  Mean abs diff: {left.mean():.6e}")
 
+    assert ref_nonzero > 0, "Reference output is all zeros — no tokens routed to local experts"
+    assert cute_nonzero > 0, "CuTeDSL output is all zeros — no tokens routed to local experts"
     assert hit_ratio >= percent, (
         f"Hit ratio {hit_ratio*100:.2f}% < {percent*100:.2f}%"
     )
@@ -157,6 +167,9 @@ def test_pipeline_small_batch():
         device=device,
     )
 
+    # Bias toward local experts so the token is actually routed
+    inputs["routing_logits"][:, :32] += 5.0
+
     out = cutedsl_fp8_moe(
         inputs["routing_logits"],
         inputs["routing_bias"],
@@ -174,6 +187,7 @@ def test_pipeline_small_batch():
     assert out.shape == (1, 7168)
     assert out.dtype == torch.bfloat16
     assert not torch.isnan(out).any()
+    assert out.abs().max().item() > 0, "Output is all zeros — no tokens routed"
 
 
 if __name__ == "__main__":
