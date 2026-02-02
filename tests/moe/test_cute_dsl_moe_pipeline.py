@@ -67,8 +67,12 @@ def test_pipeline_vs_reference(seq_len, intermediate_size):
         device=device,
     )
 
-    # Bias routing logits toward local experts so tokens actually get routed here
-    inputs["routing_logits"][:, local_expert_offset:local_expert_offset + E_LOCAL] += 5.0
+    # Force tokens to route to local experts:
+    # Set local expert logits high, non-local logits very low.
+    # DeepSeek routing uses sigmoid + group selection, so we need to dominate
+    # both the group scores and the global top-k selection.
+    inputs["routing_logits"][:, local_expert_offset:local_expert_offset + E_LOCAL] += 10.0
+    inputs["routing_logits"][:, local_expert_offset + E_LOCAL:] -= 10.0
 
     # Run reference
     ref_out = run_fp8_block_scale_moe_reference(
@@ -167,8 +171,9 @@ def test_pipeline_small_batch():
         device=device,
     )
 
-    # Bias toward local experts so the token is actually routed
-    inputs["routing_logits"][:, :32] += 5.0
+    # Force token to route to local experts
+    inputs["routing_logits"][:, :32] += 10.0
+    inputs["routing_logits"][:, 32:] -= 10.0
 
     out = cutedsl_fp8_moe(
         inputs["routing_logits"],

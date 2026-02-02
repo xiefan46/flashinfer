@@ -33,8 +33,9 @@ def _generate_inputs(seq_len, H=7168, I=2048, E_global=256, E_local=32, device="
         device=device,
     )
 
-    # Bias routing logits toward local experts so tokens are actually routed
-    inputs["routing_logits"][:, :E_local] += 5.0
+    # Force tokens to route to local experts
+    inputs["routing_logits"][:, :E_local] += 10.0
+    inputs["routing_logits"][:, E_local:] -= 10.0
 
     return inputs
 
