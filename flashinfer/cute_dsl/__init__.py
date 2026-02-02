@@ -36,6 +36,11 @@ if is_cute_dsl_available():
         AddRMSNormFP4QuantKernel,
     )
 
+# MoE pipeline components — lazy-imported to avoid pulling in heavy deps
+# (fused_moe routing kernel, gemm module) at package load time.
+# Use: from flashinfer.cute_dsl.moe_pipeline import cutedsl_fp8_moe
+# Or:  from flashinfer.cute_dsl.moe_routing import moe_routing_deepseek
+
 __all__ = [
     # Utils (always available)
     "is_cute_dsl_available",
