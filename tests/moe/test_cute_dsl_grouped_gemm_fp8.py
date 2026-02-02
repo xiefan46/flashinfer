@@ -76,6 +76,7 @@ def _fp8_block_quant_2d(w_bf16, block=128):
 @pytest.mark.parametrize("m_per_expert", [16, 64, 128])
 def test_grouped_gemm_fp8_bf16_output(N, K, E, m_per_expert):
     """Test grouped GEMM FP8 with BF16 output."""
+    print(f"\n  [GEMM] N={N}, K={K}, E={E}, m_per_expert={m_per_expert} ... ", end="", flush=True)
     device = "cuda"
     torch.manual_seed(42)
 
@@ -118,11 +119,13 @@ def test_grouped_gemm_fp8_bf16_output(N, K, E, m_per_expert):
             ref_e.flatten(), out_e.flatten(), dim=0
         )
         assert cos_sim > 0.95, f"Expert {e}: cosine similarity {cos_sim:.4f} too low"
+    print(f"PASSED (cos_sim={cos_sim:.4f})", flush=True)
 
 
 @pytest.mark.skipif(not _check_sm100(), reason="Requires SM100+")
 def test_quantize_output_fp8():
     """Test FP8 output quantization roundtrip."""
+    print("\n  [Quantize FP8] roundtrip test ... ", end="", flush=True)
     device = "cuda"
     torch.manual_seed(42)
 
@@ -144,6 +147,7 @@ def test_quantize_output_fp8():
         x_f32.flatten(), x_roundtrip.flatten(), dim=0
     )
     assert cos_sim > 0.99, f"FP8 roundtrip cosine similarity {cos_sim:.4f} too low"
+    print(f"PASSED (cos_sim={cos_sim:.4f})", flush=True)
 
 
 if __name__ == "__main__":

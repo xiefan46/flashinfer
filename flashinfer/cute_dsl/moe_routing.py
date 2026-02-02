@@ -145,7 +145,7 @@ def moe_routing_deepseek(
 
     # Allocate output tensors for fused routing
     topk_values = torch.empty(T, top_k, dtype=torch.float32, device=device)
-    topk_indices = torch.empty(T, top_k, dtype=torch.int64, device=device)
+    topk_indices = torch.empty(T, top_k, dtype=torch.int32, device=device)
 
     # Run fused DeepSeek-V3 routing kernel
     fused_topk_deepseek(

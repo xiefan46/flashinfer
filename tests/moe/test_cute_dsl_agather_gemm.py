@@ -56,6 +56,7 @@ def _fp8_block_quant_2d(w_bf16, block=128):
 @pytest.mark.parametrize("m_per_expert", [16, 64])
 def test_agather_identity_permutation(m_per_expert):
     """With identity permutation, A-gather GEMM should match standard GEMM."""
+    print(f"\n  [A-gather identity] m_per_expert={m_per_expert} ... ", end="", flush=True)
     from flashinfer.cute_dsl.moe_grouped_gemm_fp8 import moe_gemm1_fp8
     from flashinfer.gemm import group_gemm_fp8_nt_groupwise
 
@@ -104,12 +105,14 @@ def test_agather_identity_permutation(m_per_expert):
     ).item()
 
     assert cos_sim > 0.95, f"Identity A-gather cosine similarity {cos_sim:.4f} too low"
+    print(f"PASSED (cos_sim={cos_sim:.4f})", flush=True)
 
 
 @pytest.mark.skipif(not _check_sm100(), reason="Requires SM100+")
 @pytest.mark.parametrize("m_per_expert", [16, 64])
 def test_agather_random_permutation(m_per_expert):
     """Random permutation: A-gather(perm) should match pre-scattered A + standard GEMM."""
+    print(f"\n  [A-gather random] m_per_expert={m_per_expert} ... ", end="", flush=True)
     from flashinfer.cute_dsl.moe_grouped_gemm_fp8 import moe_gemm1_fp8
     from flashinfer.gemm import group_gemm_fp8_nt_groupwise
 
@@ -162,6 +165,7 @@ def test_agather_random_permutation(m_per_expert):
     ).item()
 
     assert cos_sim > 0.95, f"Random permutation A-gather cosine similarity {cos_sim:.4f} too low"
+    print(f"PASSED (cos_sim={cos_sim:.4f})", flush=True)
 
 
 if __name__ == "__main__":
