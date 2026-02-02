@@ -24,7 +24,7 @@ def _generate_inputs(seq_len, H=7168, I=2048, E_global=256, E_local=32, device="
 
     from tests.moe.test_dpsk_fused_moe_fp8 import generate_random_inputs_moe
 
-    return generate_random_inputs_moe(
+    inputs = generate_random_inputs_moe(
         seq_len,
         num_experts_global=E_global,
         num_local_experts=E_local,
@@ -32,6 +32,11 @@ def _generate_inputs(seq_len, H=7168, I=2048, E_global=256, E_local=32, device="
         intermediate_size=I,
         device=device,
     )
+
+    # Bias routing logits toward local experts so tokens are actually routed
+    inputs["routing_logits"][:, :E_local] += 5.0
+
+    return inputs
 
 
 def bench_pipeline(seq_len, intermediate_size=2048, num_iters=20, warmup_iters=5):
