@@ -244,8 +244,8 @@ def test_pipeline_vs_trtllm(seq_len, intermediate_size):
     inputs["routing_logits"][:, local_expert_offset:local_expert_offset + E_LOCAL] += 10.0
     inputs["routing_logits"][:, local_expert_offset + E_LOCAL:] -= 10.0
 
-    # Run trtllm kernel
-    with autotune(True):
+    # Run trtllm kernel (autotune off to avoid slow first-run tuning)
+    with autotune(False):
         trtllm_out = trtllm_fp8_block_scale_moe(
             inputs["routing_logits"].to(torch.float32),
             inputs["routing_bias"],

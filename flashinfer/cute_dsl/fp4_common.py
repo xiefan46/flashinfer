@@ -514,6 +514,90 @@ def bfloat2_to_float2_scaled(
 
 
 @dsl_user_op
+def cvt_e4m3_to_f32(fp8_u8: cutlass.Uint8, *, loc=None, ip=None) -> Float32:
+    """Convert a single FP8 E4M3 byte to float32.
+
+    E4M3 format: sign(1) | exponent(4) | mantissa(3), bias=7.
+    Uses ex2.approx for 2^(exp-7), same approach as fp8_e4m3_to_f32_and_rcp
+    but returns the value directly (with sign) instead of its reciprocal.
+
+    Note: subnormal E4M3 values (exp=0, mant!=0) are approximated as
+    2^(-7) * (1 + mant/8) instead of the exact 2^(-6) * mant/8.
+    The error is negligible for our FP8 MoE pipeline.
+    """
+    return Float32(
+        llvm.inline_asm(
+            T.f32(),
+            [cutlass.Uint8(fp8_u8).ir_value(loc=loc, ip=ip)],
+            """
+            {
+                .reg .pred p_zero;
+                .reg .u32 val, sign_u, abs_val, exp_u, mant_u, result_bits;
+                .reg .s32 exp_s;
+                .reg .f32 exp_f, mant_f, abs_result;
+
+                cvt.u32.u8 val, $1;
+                and.b32 abs_val, val, 0x7F;
+                setp.eq.u32 p_zero, abs_val, 0;
+
+                and.b32 mant_u, abs_val, 7;
+                shr.b32 exp_u, abs_val, 3;
+
+                sub.s32 exp_s, exp_u, 7;
+                cvt.rn.f32.s32 exp_f, exp_s;
+                ex2.approx.f32 exp_f, exp_f;
+                cvt.rn.f32.u32 mant_f, mant_u;
+                fma.rn.f32 mant_f, mant_f, 0f3E000000, 0f3F800000;
+                mul.f32 abs_result, exp_f, mant_f;
+
+                mov.b32 result_bits, abs_result;
+                and.b32 sign_u, val, 0x80;
+                shl.b32 sign_u, sign_u, 24;
+                or.b32 result_bits, result_bits, sign_u;
+                mov.b32 abs_result, result_bits;
+
+                selp.f32 $0, 0f00000000, abs_result, p_zero;
+            }
+            """,
+            "=f,r",
+            has_side_effects=False,
+            is_align_stack=False,
+            asm_dialect=llvm.AsmDialect.AD_ATT,
+        )
+    )
+
+
+@dsl_user_op
+def silu_f32(x: Float32, *, loc=None, ip=None) -> Float32:
+    """Compute SiLU(x) = x / (1 + exp(-x)) using PTX approximate math.
+
+    Uses ex2.approx for fast exp2 and rcp.approx for reciprocal.
+    exp(-x) = 2^(-x * log2(e)), log2(e) ~= 1.4426950408889634 = 0x3FB8AA3B in IEEE 754.
+    """
+    return Float32(
+        llvm.inline_asm(
+            T.f32(),
+            [Float32(x).ir_value(loc=loc, ip=ip)],
+            """
+            {
+                .reg .f32 neg_x, neg_x_log2e, exp_neg_x, one_plus_exp, rcp_val;
+                neg.f32 neg_x, $1;
+                mul.f32 neg_x_log2e, neg_x, 0f3FB8AA3B;
+                ex2.approx.f32 exp_neg_x, neg_x_log2e;
+                add.f32 one_plus_exp, exp_neg_x, 0f3F800000;
+                rcp.approx.ftz.f32 rcp_val, one_plus_exp;
+                mul.f32 $0, $1, rcp_val;
+            }
+            """,
+            "=f,f",
+            has_side_effects=False,
+            is_align_stack=False,
+            asm_dialect=llvm.AsmDialect.AD_ATT,
+        )
+    )
+
+
+@dsl_user_op
 def cvt_f32_to_e4m3(a: Float32, *, loc=None, ip=None) -> Uint32:
     """Convert float32 to E4M3 using native cvt.rn.satfinite.e4m3x2.f32."""
     return Uint32(
