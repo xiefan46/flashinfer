@@ -50,8 +50,8 @@ def _compute_permutation_indices(
     local_expert_offset: int,
     top_k: int,
     pad_to: int = 1,
-) -> MoERoutingOutput:
-    """Compute permutation indices from routing results.
+):
+    """Compute permutation indices from routing results (vectorized).
 
     Given topk_indices [T, top_k] with global expert IDs, compute:
     1. masked_m: how many tokens each local expert received
@@ -66,11 +66,20 @@ def _compute_permutation_indices(
     E_local = num_local_experts
     local_end = local_expert_offset + E_local
 
-    # Count tokens per local expert
-    masked_m = torch.zeros(E_local, dtype=torch.int32, device=device)
-    for e in range(E_local):
-        global_e = local_expert_offset + e
-        masked_m[e] = (topk_indices == global_e).sum().item()
+    # Flatten to [T * top_k]
+    topk_flat = topk_indices.view(-1)
+
+    # Identify entries routed to local experts
+    local_mask = (topk_flat >= local_expert_offset) & (topk_flat < local_end)
+    local_e_all = (topk_flat - local_expert_offset).to(torch.int32)
+
+    # Count tokens per local expert via bincount
+    # Mask non-local entries to 0 then subtract their contribution
+    masked_local_e = local_e_all.clamp(0, E_local - 1)
+    masked_local_e = torch.where(local_mask, masked_local_e, torch.zeros_like(masked_local_e))
+    masked_m = torch.bincount(
+        masked_local_e[local_mask].long(), minlength=E_local
+    ).to(torch.int32)
 
     # Pad each expert's count to multiple of pad_to
     if pad_to > 1:
@@ -83,7 +92,7 @@ def _compute_permutation_indices(
     m_indptr[1:] = torch.cumsum(padded_m, dim=0)
     max_padded_tokens = int(m_indptr[-1].item())
 
-    # Build permuted_idx_to_token_idx and expanded_idx_to_permuted_idx
+    # Output tensors
     permuted_idx_to_token_idx = torch.full(
         (max(max_padded_tokens, 1),), -1, dtype=torch.int32, device=device
     )
@@ -91,23 +100,33 @@ def _compute_permutation_indices(
         (T * top_k,), -1, dtype=torch.int32, device=device
     )
 
-    # Per-expert counters for filling positions
-    expert_fill_count = torch.zeros(E_local, dtype=torch.int32, device=device)
+    # Get flat indices of local entries
+    local_indices = torch.where(local_mask)[0]  # indices into topk_flat
+    if local_indices.numel() == 0:
+        return masked_m, padded_m, m_indptr, max_padded_tokens, permuted_idx_to_token_idx, expanded_idx_to_permuted_idx
 
-    # Iterate over all (token, k) pairs
-    topk_flat = topk_indices.view(-1)  # [T * top_k]
-    for idx in range(T * top_k):
-        global_e = int(topk_flat[idx].item())
-        if global_e < local_expert_offset or global_e >= local_end:
-            continue
-        local_e = global_e - local_expert_offset
-        token_id = idx // top_k
-        pos_in_expert = int(expert_fill_count[local_e].item())
-        permuted_pos = int(m_indptr[local_e].item()) + pos_in_expert
+    local_experts = local_e_all[local_indices]  # [num_local_entries] int32
+    local_token_ids = (local_indices // top_k).to(torch.int32)  # token id for each entry
 
-        permuted_idx_to_token_idx[permuted_pos] = token_id
-        expanded_idx_to_permuted_idx[idx] = permuted_pos
-        expert_fill_count[local_e] += 1
+    # Stable sort by expert — preserves original idx order within each expert
+    sorted_order = torch.argsort(local_experts.long(), stable=True)
+    sorted_experts = local_experts[sorted_order]
+    sorted_flat_indices = local_indices[sorted_order]
+    sorted_token_ids = local_token_ids[sorted_order]
+
+    # Compute within-expert position using unpadded cumsum offsets
+    expert_start = torch.zeros(E_local + 1, dtype=torch.int32, device=device)
+    expert_start[1:] = torch.cumsum(masked_m, dim=0)
+    # Each element's position-in-expert = its index in sorted array - expert_start[its expert]
+    pos_in_sorted = torch.arange(local_indices.numel(), dtype=torch.int32, device=device)
+    pos_in_expert = pos_in_sorted - expert_start[sorted_experts.long()]
+
+    # Permuted position = m_indptr[expert] + pos_in_expert (using padded offsets)
+    permuted_pos = m_indptr[sorted_experts.long()] + pos_in_expert
+
+    # Scatter into output tensors
+    permuted_idx_to_token_idx[permuted_pos.long()] = sorted_token_ids
+    expanded_idx_to_permuted_idx[sorted_flat_indices.long()] = permuted_pos
 
     return masked_m, padded_m, m_indptr, max_padded_tokens, permuted_idx_to_token_idx, expanded_idx_to_permuted_idx
 
