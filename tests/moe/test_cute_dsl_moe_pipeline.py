@@ -45,11 +45,14 @@ def _check_trtllm_available():
 @pytest.mark.parametrize("intermediate_size", [512, 2048])
 def test_pipeline_vs_reference(seq_len, intermediate_size):
     """Test CuTeDSL MoE pipeline against Python reference."""
+    print(f"\n  [vs ref] T={seq_len}, I={intermediate_size}", flush=True)
+    print(f"    Importing pipeline ...", end="", flush=True)
     from flashinfer.cute_dsl.moe_pipeline import cutedsl_fp8_moe
     from .test_dpsk_fused_moe_fp8 import (
         generate_random_inputs_moe,
         run_fp8_block_scale_moe_reference,
     )
+    print(" done", flush=True)
 
     device = "cuda"
     torch.manual_seed(42)
@@ -64,6 +67,7 @@ def test_pipeline_vs_reference(seq_len, intermediate_size):
     local_expert_offset = 0
     routed_scaling_factor = 2.5
 
+    print(f"    Generating inputs ...", end="", flush=True)
     # Generate inputs
     inputs = generate_random_inputs_moe(
         seq_len,
@@ -77,6 +81,8 @@ def test_pipeline_vs_reference(seq_len, intermediate_size):
         device=device,
     )
 
+    print(" done", flush=True)
+
     # Force tokens to route to local experts:
     # Set local expert logits high, non-local logits very low.
     # DeepSeek routing uses sigmoid + group selection, so we need to dominate
@@ -85,6 +91,7 @@ def test_pipeline_vs_reference(seq_len, intermediate_size):
     inputs["routing_logits"][:, local_expert_offset + E_LOCAL:] -= 10.0
 
     # Run reference
+    print(f"    Running reference ...", end="", flush=True)
     ref_out = run_fp8_block_scale_moe_reference(
         routing_logits=inputs["routing_logits"],
         routing_bias=inputs["routing_bias"],
@@ -104,8 +111,10 @@ def test_pipeline_vs_reference(seq_len, intermediate_size):
         n_group=N_GROUP,
         topk_group=TOPK_GROUP,
     )
+    print(" done", flush=True)
 
     # Run CuTeDSL pipeline
+    print(f"    Running CuTeDSL pipeline (JIT compile on first run) ...", end="", flush=True)
     cute_out = cutedsl_fp8_moe(
         inputs["routing_logits"],
         inputs["routing_bias"],
@@ -124,6 +133,7 @@ def test_pipeline_vs_reference(seq_len, intermediate_size):
         intermediate_size=I,
         routed_scaling_factor=routed_scaling_factor,
     )
+    print(" done", flush=True)
 
     # The Python reference uses exact float32 matmul while CuTeDSL uses FP8 GEMM.
     # With random inputs (K=7168), output magnitudes reach millions, making fixed
@@ -163,12 +173,14 @@ def test_pipeline_vs_reference(seq_len, intermediate_size):
 @pytest.mark.skipif(not _check_pipeline_available(), reason="Pipeline not available")
 def test_pipeline_small_batch():
     """Test pipeline with very small batch (edge case)."""
+    print(f"\n  [small batch] T=1", flush=True)
     from flashinfer.cute_dsl.moe_pipeline import cutedsl_fp8_moe
     from .test_dpsk_fused_moe_fp8 import generate_random_inputs_moe
 
     device = "cuda"
     torch.manual_seed(42)
 
+    print(f"    Generating inputs ...", end="", flush=True)
     inputs = generate_random_inputs_moe(
         1,
         num_experts_global=256,
@@ -178,10 +190,13 @@ def test_pipeline_small_batch():
         device=device,
     )
 
+    print(" done", flush=True)
+
     # Force token to route to local experts
     inputs["routing_logits"][:, :32] += 10.0
     inputs["routing_logits"][:, 32:] -= 10.0
 
+    print(f"    Running CuTeDSL pipeline ...", end="", flush=True)
     out = cutedsl_fp8_moe(
         inputs["routing_logits"],
         inputs["routing_bias"],
@@ -195,11 +210,13 @@ def test_pipeline_small_batch():
         num_local_experts=32,
         intermediate_size=2048,
     )
+    print(" done", flush=True)
 
     assert out.shape == (1, 7168)
     assert out.dtype == torch.bfloat16
     assert not torch.isnan(out).any()
     assert out.abs().max().item() > 0, "Output is all zeros — no tokens routed"
+    print(f"    PASSED", flush=True)
 
 
 @pytest.mark.skipif(not _check_sm100(), reason="Requires SM100+")
@@ -209,10 +226,13 @@ def test_pipeline_small_batch():
 @pytest.mark.parametrize("intermediate_size", [512, 2048])
 def test_pipeline_vs_trtllm(seq_len, intermediate_size):
     """Test CuTeDSL MoE pipeline against trtllm CUTLASS kernel."""
+    print(f"\n  [vs trtllm] T={seq_len}, I={intermediate_size}", flush=True)
+    print(f"    Importing ...", end="", flush=True)
     from flashinfer.cute_dsl.moe_pipeline import cutedsl_fp8_moe
     from flashinfer.fused_moe import trtllm_fp8_block_scale_moe, WeightLayout
     from flashinfer.autotuner import autotune
     from .test_dpsk_fused_moe_fp8 import generate_random_inputs_moe
+    print(" done", flush=True)
 
     device = "cuda"
     torch.manual_seed(42)
@@ -227,6 +247,7 @@ def test_pipeline_vs_trtllm(seq_len, intermediate_size):
     local_expert_offset = 0
     routed_scaling_factor = 2.5
 
+    print(f"    Generating inputs ...", end="", flush=True)
     # Generate inputs
     inputs = generate_random_inputs_moe(
         seq_len,
@@ -240,11 +261,14 @@ def test_pipeline_vs_trtllm(seq_len, intermediate_size):
         device=device,
     )
 
+    print(" done", flush=True)
+
     # Force tokens to route to local experts
     inputs["routing_logits"][:, local_expert_offset:local_expert_offset + E_LOCAL] += 10.0
     inputs["routing_logits"][:, local_expert_offset + E_LOCAL:] -= 10.0
 
     # Run trtllm kernel (autotune off to avoid slow first-run tuning)
+    print(f"    Running trtllm kernel (JIT compile on first run) ...", end="", flush=True)
     with autotune(False):
         trtllm_out = trtllm_fp8_block_scale_moe(
             inputs["routing_logits"].to(torch.float32),
@@ -270,7 +294,10 @@ def test_pipeline_vs_trtllm(seq_len, intermediate_size):
             tune_max_num_tokens=4096,
         )
 
+    print(" done", flush=True)
+
     # Run CuTeDSL pipeline
+    print(f"    Running CuTeDSL pipeline ...", end="", flush=True)
     cute_out = cutedsl_fp8_moe(
         inputs["routing_logits"],
         inputs["routing_bias"],
@@ -289,6 +316,7 @@ def test_pipeline_vs_trtllm(seq_len, intermediate_size):
         intermediate_size=I,
         routed_scaling_factor=routed_scaling_factor,
     )
+    print(" done", flush=True)
 
     # Both are FP8 kernels with different GEMM implementations.
     # Cosine similarity is the primary metric; both should agree well since
