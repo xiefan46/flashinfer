@@ -204,10 +204,96 @@ def test_routing_kernel_vs_reference(seq_len):
     # Compare permutation structure
     assert kernel_result.masked_m.sum() == ref_result.masked_m.sum()
 
+    # Compare permutation indices exactly (both use the same vectorized
+    # _compute_permutation_indices, so they must match given same topk_indices)
+    assert torch.equal(kernel_result.masked_m, ref_result.masked_m), (
+        f"masked_m mismatch:\nkernel={kernel_result.masked_m}\nref={ref_result.masked_m}"
+    )
+    assert torch.equal(kernel_result.m_indptr, ref_result.m_indptr), (
+        f"m_indptr mismatch:\nkernel={kernel_result.m_indptr}\nref={ref_result.m_indptr}"
+    )
+    assert torch.equal(
+        kernel_result.permuted_idx_to_token_idx,
+        ref_result.permuted_idx_to_token_idx,
+    ), "permuted_idx_to_token_idx mismatch"
+    assert torch.equal(
+        kernel_result.expanded_idx_to_permuted_idx,
+        ref_result.expanded_idx_to_permuted_idx,
+    ), "expanded_idx_to_permuted_idx mismatch"
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")
+@pytest.mark.parametrize("seq_len", [4, 16, 64, 256])
+@pytest.mark.parametrize("pad_to", [1, 4])
+def test_kernel_permutation_roundtrip(seq_len, pad_to):
+    """Verify permutation roundtrip for moe_routing_deepseek (vectorized path)."""
+    if not _check_routing_available():
+        pytest.skip("Fused routing kernel not available")
+
+    from flashinfer.utils import get_compute_capability
+
+    cc = get_compute_capability(torch.device("cuda"))
+    if cc[0] not in [8, 9, 10, 12]:
+        pytest.skip(f"Unsupported compute capability {cc}")
+
+    device = "cuda"
+    torch.manual_seed(42)
+
+    E_global = 256
+    E_local = 32
+    top_k = 8
+    local_expert_offset = 0
+
+    routing_logits = torch.randn(seq_len, E_global, dtype=torch.float32, device=device)
+    routing_bias = torch.randn(E_global, dtype=torch.bfloat16, device=device)
+
+    result = moe_routing_deepseek(
+        routing_logits,
+        routing_bias,
+        num_local_experts=E_local,
+        local_expert_offset=local_expert_offset,
+        top_k=top_k,
+        pad_to=pad_to,
+    )
+
+    # Roundtrip: expanded_idx -> permuted_idx -> token_id must match idx // top_k
+    exp_to_perm = result.expanded_idx_to_permuted_idx.cpu()
+    perm_to_tok = result.permuted_idx_to_token_idx.cpu()
+    topk_idx = result.topk_indices.cpu()
+    local_end = local_expert_offset + E_local
+
+    for idx in range(seq_len * top_k):
+        perm_idx = exp_to_perm[idx].item()
+        global_e = topk_idx[idx // top_k, idx % top_k].item()
+        is_local = local_expert_offset <= global_e < local_end
+
+        if is_local:
+            assert perm_idx >= 0, f"Local expert entry {idx} has perm_idx={perm_idx}"
+            mapped_token = perm_to_tok[perm_idx].item()
+            expected_token = idx // top_k
+            assert mapped_token == expected_token, (
+                f"Roundtrip failed at idx={idx}: perm_idx={perm_idx}, "
+                f"mapped_token={mapped_token}, expected={expected_token}"
+            )
+        else:
+            assert perm_idx == -1, (
+                f"Non-local expert entry {idx} (expert={global_e}) has perm_idx={perm_idx}"
+            )
+
+    # m_indptr consistency: last element = max_padded_tokens
+    assert result.m_indptr[-1].item() == result.max_padded_tokens
+
+    # padded_m elements must be multiples of pad_to
+    padded_m = result.m_indptr[1:] - result.m_indptr[:-1]
+    if pad_to > 1:
+        assert (padded_m % pad_to == 0).all(), f"padded_m not aligned to {pad_to}: {padded_m}"
+
 
 if __name__ == "__main__":
     test_routing_reference_properties(16, 8, 4, 8, 256)
     print("test_routing_reference_properties passed")
     test_permutation_roundtrip(16)
     print("test_permutation_roundtrip passed")
+    test_kernel_permutation_roundtrip(16, 4)
+    print("test_kernel_permutation_roundtrip passed")
     print("All routing tests passed!")
