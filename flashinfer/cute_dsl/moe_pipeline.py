@@ -37,7 +37,7 @@ from ..api_logging import flashinfer_api
 from .moe_routing import moe_routing_deepseek, MoERoutingOutput
 from .moe_grouped_gemm_fp8 import moe_gemm1_fp8, moe_gemm2_fp8
 from .moe_activation import moe_swiglu_fp8_requant
-from .moe_finalize import moe_finalize_vectorized
+from .moe_finalize import moe_finalize
 
 
 class MoEWorkspace(NamedTuple):
@@ -186,7 +186,7 @@ def cutedsl_fp8_moe(
     )
 
     # --- Stage 5: Finalize (Gather + Weighted Reduce) ---
-    output = moe_finalize_vectorized(
+    output = moe_finalize(
         gemm2_out,
         routing_result.topk_values,
         routing_result.topk_indices,

@@ -3,7 +3,7 @@
 import pytest
 import torch
 
-from flashinfer.cute_dsl.moe_finalize import moe_finalize, moe_finalize_vectorized
+from flashinfer.cute_dsl.moe_finalize import moe_finalize, moe_finalize_reference
 
 
 def _setup_finalize_inputs(T, top_k, H, E_local, local_expert_offset, device="cuda"):
@@ -99,7 +99,7 @@ def _reference_finalize(
 @pytest.mark.parametrize("top_k", [4, 8])
 @pytest.mark.parametrize("H", [256, 1024])
 def test_finalize_correctness(T, top_k, H):
-    """Test finalize against Python reference."""
+    """Test CuTeDSL finalize kernel against Python reference."""
     device = "cuda"
     torch.manual_seed(42)
     E_local = 32
@@ -114,7 +114,7 @@ def test_finalize_correctness(T, top_k, H):
         max_padded,
     ) = _setup_finalize_inputs(T, top_k, H, E_local, local_expert_offset, device)
 
-    # Run kernel
+    # Run CuTeDSL kernel
     output = moe_finalize(
         gemm2_out,
         expert_weights,
@@ -134,7 +134,6 @@ def test_finalize_correctness(T, top_k, H):
     assert output.shape == (T, H)
     assert output.dtype == torch.bfloat16
 
-    # Should be exact (same algorithm)
     assert torch.allclose(output.float(), ref.float(), atol=1e-3), (
         f"Max diff: {(output.float() - ref.float()).abs().max():.6e}"
     )
@@ -142,8 +141,8 @@ def test_finalize_correctness(T, top_k, H):
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")
 @pytest.mark.parametrize("T", [4, 16, 64])
-def test_finalize_vectorized_matches_loop(T):
-    """Test vectorized finalize matches loop version."""
+def test_finalize_matches_reference(T):
+    """Test CuTeDSL kernel matches moe_finalize_reference."""
     device = "cuda"
     torch.manual_seed(42)
     top_k = 8
@@ -160,18 +159,18 @@ def test_finalize_vectorized_matches_loop(T):
         max_padded,
     ) = _setup_finalize_inputs(T, top_k, H, E_local, local_expert_offset, device)
 
-    out_loop = moe_finalize(
+    out_ref = moe_finalize_reference(
         gemm2_out, expert_weights, topk_indices,
         expanded_idx_to_permuted_idx, E_local, local_expert_offset, H,
     )
 
-    out_vec = moe_finalize_vectorized(
+    out_kernel = moe_finalize(
         gemm2_out, expert_weights, topk_indices,
         expanded_idx_to_permuted_idx, E_local, local_expert_offset, H,
     )
 
-    assert torch.allclose(out_loop.float(), out_vec.float(), atol=1e-3), (
-        f"Max diff: {(out_loop.float() - out_vec.float()).abs().max():.6e}"
+    assert torch.allclose(out_ref.float(), out_kernel.float(), atol=1e-3), (
+        f"Max diff: {(out_ref.float() - out_kernel.float()).abs().max():.6e}"
     )
 
 
@@ -203,8 +202,8 @@ def test_finalize_no_local_experts():
 if __name__ == "__main__":
     test_finalize_correctness(16, 8, 512)
     print("test_finalize_correctness passed")
-    test_finalize_vectorized_matches_loop(16)
-    print("test_finalize_vectorized_matches_loop passed")
+    test_finalize_matches_reference(16)
+    print("test_finalize_matches_reference passed")
     test_finalize_no_local_experts()
     print("test_finalize_no_local_experts passed")
     print("All finalize tests passed!")

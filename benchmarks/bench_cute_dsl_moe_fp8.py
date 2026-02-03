@@ -206,10 +206,10 @@ def bench_per_stage(seq_len, intermediate_size=2048):
         print("  GEMM2: (CUPTI failed)")
 
     # Stage 5: Finalize
-    from flashinfer.cute_dsl.moe_finalize import moe_finalize_vectorized
+    from flashinfer.cute_dsl.moe_finalize import moe_finalize
 
     def run_finalize():
-        return moe_finalize_vectorized(
+        return moe_finalize(
             gemm2_out,
             routing_result.topk_values,
             routing_result.topk_indices,

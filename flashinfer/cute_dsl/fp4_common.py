@@ -568,6 +568,115 @@ def cvt_e4m3_to_f32(fp8_u8: cutlass.Uint8, *, loc=None, ip=None) -> Float32:
 
 
 @dsl_user_op
+def cvt_bf16_to_f32(bf16_raw: Uint32, *, loc=None, ip=None) -> Float32:
+    """Convert a BF16 value (stored as lower 16 bits of Uint32) to Float32.
+
+    BF16 is the upper 16 bits of a Float32, so we just shift left by 16.
+    """
+    return Float32(
+        llvm.inline_asm(
+            T.f32(),
+            [Uint32(bf16_raw).ir_value(loc=loc, ip=ip)],
+            """
+            {
+                .reg .b32 tmp;
+                shl.b32 tmp, $1, 16;
+                mov.b32 $0, tmp;
+            }
+            """,
+            "=f,r",
+            has_side_effects=False,
+            is_align_stack=False,
+            asm_dialect=llvm.AsmDialect.AD_ATT,
+        )
+    )
+
+
+@dsl_user_op
+def cvt_f32_to_bf16(val: Float32, *, loc=None, ip=None) -> Uint32:
+    """Convert Float32 to BF16, returned as Uint32 (lower 16 bits).
+
+    Uses PTX cvt.rn.bf16.f32 for proper rounding.
+    """
+    return Uint32(
+        llvm.inline_asm(
+            T.i32(),
+            [Float32(val).ir_value(loc=loc, ip=ip)],
+            """
+            {
+                .reg .b16 bf16_val;
+                cvt.rn.bf16.f32 bf16_val, $1;
+                cvt.u32.u16 $0, bf16_val;
+            }
+            """,
+            "=r,f",
+            has_side_effects=False,
+            is_align_stack=False,
+            asm_dialect=llvm.AsmDialect.AD_ATT,
+        )
+    )
+
+
+@dsl_user_op
+def pack_two_bf16(lo: Uint32, hi: Uint32, *, loc=None, ip=None) -> Uint32:
+    """Pack two BF16 values (each in lower 16 bits of Uint32) into one Uint32.
+
+    Result: (hi << 16) | (lo & 0xFFFF)
+    This matches the bfloat16x2 memory layout (first element in low bits).
+    """
+    return Uint32(
+        llvm.inline_asm(
+            T.i32(),
+            [Uint32(lo).ir_value(loc=loc, ip=ip), Uint32(hi).ir_value(loc=loc, ip=ip)],
+            """
+            {
+                .reg .b32 lo16, hi16;
+                and.b32 lo16, $1, 0xFFFF;
+                shl.b32 hi16, $2, 16;
+                or.b32 $0, lo16, hi16;
+            }
+            """,
+            "=r,r,r",
+            has_side_effects=False,
+            is_align_stack=False,
+            asm_dialect=llvm.AsmDialect.AD_ATT,
+        )
+    )
+
+
+@dsl_user_op
+def unpack_bf16_lo(packed: Uint32, *, loc=None, ip=None) -> Uint32:
+    """Extract low BF16 from packed bfloat16x2 (lower 16 bits)."""
+    return Uint32(
+        llvm.inline_asm(
+            T.i32(),
+            [Uint32(packed).ir_value(loc=loc, ip=ip)],
+            "and.b32 $0, $1, 0xFFFF;",
+            "=r,r",
+            has_side_effects=False,
+            is_align_stack=False,
+            asm_dialect=llvm.AsmDialect.AD_ATT,
+        )
+    )
+
+
+@dsl_user_op
+def unpack_bf16_hi(packed: Uint32, *, loc=None, ip=None) -> Uint32:
+    """Extract high BF16 from packed bfloat16x2 (upper 16 bits, shifted to lower)."""
+    return Uint32(
+        llvm.inline_asm(
+            T.i32(),
+            [Uint32(packed).ir_value(loc=loc, ip=ip)],
+            "shr.b32 $0, $1, 16;",
+            "=r,r",
+            has_side_effects=False,
+            is_align_stack=False,
+            asm_dialect=llvm.AsmDialect.AD_ATT,
+        )
+    )
+
+
+@dsl_user_op
 def silu_f32(x: Float32, *, loc=None, ip=None) -> Float32:
     """Compute SiLU(x) = x / (1 + exp(-x)) using PTX approximate math.
 
