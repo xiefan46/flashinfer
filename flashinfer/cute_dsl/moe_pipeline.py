@@ -34,7 +34,7 @@ from typing import NamedTuple, Optional
 import torch
 
 from ..api_logging import flashinfer_api
-from .moe_routing import moe_routing_deepseek, MoERoutingOutput
+from .moe_routing import moe_routing_sglang, MoERoutingOutput
 from .moe_grouped_gemm_fp8 import moe_gemm1_fp8, moe_gemm2_fp8
 from .moe_activation import moe_swiglu_fp8_requant
 from .moe_finalize import moe_finalize
@@ -131,8 +131,8 @@ def cutedsl_fp8_moe(
     I = intermediate_size
     device = hidden_states.device
 
-    # --- Stage 1: Routing ---
-    routing_result = moe_routing_deepseek(
+    # --- Stage 1: Routing (sgl_kernel backend) ---
+    routing_result = moe_routing_sglang(
         routing_logits,
         routing_bias,
         num_local_experts=num_local_experts,
@@ -141,7 +141,8 @@ def cutedsl_fp8_moe(
         topk_group=topk_group,
         top_k=top_k,
         routed_scaling_factor=routed_scaling_factor,
-        pad_to=4,  # group_gemm_fp8_nt_groupwise requires 4-alignment
+        intermediate_size=I,
+        hidden_size=H,
     )
 
     max_padded = routing_result.max_padded_tokens

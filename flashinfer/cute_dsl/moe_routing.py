@@ -22,6 +22,10 @@ needed by downstream GEMM and finalize stages:
   - permuted_idx_to_token_idx [max_padded]: GEMM1 A-gather scatter index
   - expanded_idx_to_permuted_idx [T*top_k]: Finalize gather index
   - expert_weights [T, top_k]: routing weights
+
+Two backends:
+  - moe_routing_deepseek: fused_topk_deepseek + vectorized PyTorch permutation
+  - moe_routing_sglang: sgl_kernel moe_fused_gate + prepare_moe_input (faster)
 """
 
 from typing import NamedTuple
@@ -291,4 +295,121 @@ def moe_routing_reference(
         expanded_idx_to_permuted_idx=expanded_idx_to_permuted_idx,
         max_padded_tokens=max_padded_tokens,
         m_indptr=m_indptr,
+    )
+
+
+@flashinfer_api
+def moe_routing_sglang(
+    routing_logits: torch.Tensor,
+    routing_bias: torch.Tensor,
+    num_local_experts: int,
+    local_expert_offset: int = 0,
+    n_group: int = 8,
+    topk_group: int = 4,
+    top_k: int = 8,
+    routed_scaling_factor: float = 2.5,
+    intermediate_size: int = 2048,
+    hidden_size: int = 7168,
+    pad_to: int = 1,
+) -> MoERoutingOutput:
+    """Run DeepSeek-V3 routing using sgl_kernel (moe_fused_gate + prepare_moe_input).
+
+    Faster than moe_routing_deepseek by using fused CUDA kernels from sgl_kernel
+    instead of Python-level torch ops for permutation index computation.
+
+    Args:
+        routing_logits: [T, E_global] float32 routing scores.
+        routing_bias: [E_global] routing bias (bf16 or f32).
+        num_local_experts: number of local experts on this rank.
+        local_expert_offset: global expert ID offset for local experts.
+        n_group: number of expert groups (DeepSeek-V3: 8).
+        topk_group: number of top groups (DeepSeek-V3: 4).
+        top_k: number of experts per token (DeepSeek-V3: 8).
+        routed_scaling_factor: scaling factor for routing weights.
+        intermediate_size: I dimension (needed by prepare_moe_input).
+        hidden_size: H dimension (needed by prepare_moe_input).
+        pad_to: unused (kept for API compat; sgl_kernel doesn't pad).
+
+    Returns:
+        MoERoutingOutput with all index tensors needed by downstream stages.
+    """
+    from sgl_kernel import moe_fused_gate, prepare_moe_input
+
+    T, E_global = routing_logits.shape
+    E_local = num_local_experts
+    device = routing_logits.device
+
+    # --- Step 1: DeepSeek-V3 routing via moe_fused_gate ---
+    topk_weights, topk_ids = moe_fused_gate(
+        routing_logits.to(torch.float32).contiguous(),
+        routing_bias.to(torch.float32).contiguous(),
+        n_group,
+        topk_group,
+        top_k,
+        num_fused_shared_experts=0,
+        routed_scaling_factor=float(routed_scaling_factor),
+        apply_routed_scaling_factor_on_output=False,
+    )
+    # Apply scaling factor (moe_fused_gate normalizes but doesn't scale when
+    # apply_routed_scaling_factor_on_output=False)
+    topk_weights = topk_weights * routed_scaling_factor
+
+    # Save original global expert IDs for finalize stage
+    topk_indices_global = topk_ids.clone()
+
+    # --- Step 2: Map global expert IDs to local [0, E_local) ---
+    # Non-local experts get mapped to E_local (out of range) so
+    # prepare_moe_input won't count them.
+    local_end = local_expert_offset + E_local
+    local_mask = (topk_ids >= local_expert_offset) & (topk_ids < local_end)
+    local_ids = (topk_ids - local_expert_offset).to(torch.int32)
+    # Set non-local to E_local (will be ignored by prepare_moe_input)
+    local_ids = torch.where(local_mask, local_ids, torch.full_like(local_ids, E_local))
+    topk_ids_local = local_ids.to(torch.int32)
+
+    # --- Step 3: prepare_moe_input ---
+    m = T
+    expert_offsets = torch.empty((E_local + 1,), dtype=torch.int32, device=device)
+    problem_sizes1 = torch.empty((E_local, 3), dtype=torch.int32, device=device)
+    problem_sizes2 = torch.empty((E_local, 3), dtype=torch.int32, device=device)
+    a_map = torch.empty((m * top_k,), dtype=torch.int32, device=device)
+    # Pre-fill c_map with -1 so non-local entries stay -1
+    c_map = torch.full((m * top_k,), -1, dtype=torch.int32, device=device)
+
+    prepare_moe_input(
+        topk_ids_local,
+        expert_offsets,
+        problem_sizes1,
+        problem_sizes2,
+        a_map,
+        c_map,
+        E_local,
+        intermediate_size,
+        hidden_size,
+    )
+
+    # --- Step 4: Map to MoERoutingOutput ---
+    max_padded_tokens = int(expert_offsets[-1].item())
+    masked_m = (expert_offsets[1:] - expert_offsets[:-1]).to(torch.int32)
+
+    # a_map = permuted_idx_to_token_idx (token ID for each permuted slot)
+    # Only first max_padded_tokens entries are valid
+    if max_padded_tokens > 0:
+        permuted_idx_to_token_idx = a_map[:max_padded_tokens]
+    else:
+        permuted_idx_to_token_idx = torch.full(
+            (1,), -1, dtype=torch.int32, device=device
+        )
+
+    # c_map = expanded_idx_to_permuted_idx (-1 for non-local entries)
+    expanded_idx_to_permuted_idx = c_map
+
+    return MoERoutingOutput(
+        topk_values=topk_weights.to(torch.float32),
+        topk_indices=topk_indices_global,
+        masked_m=masked_m,
+        permuted_idx_to_token_idx=permuted_idx_to_token_idx,
+        expanded_idx_to_permuted_idx=expanded_idx_to_permuted_idx,
+        max_padded_tokens=max_padded_tokens,
+        m_indptr=expert_offsets,
     )

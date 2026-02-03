@@ -5,6 +5,7 @@ import torch
 from flashinfer.cute_dsl.moe_routing import (
     moe_routing_deepseek,
     moe_routing_reference,
+    moe_routing_sglang,
     _compute_permutation_indices,
 )
 
@@ -289,6 +290,201 @@ def test_kernel_permutation_roundtrip(seq_len, pad_to):
         assert (padded_m % pad_to == 0).all(), f"padded_m not aligned to {pad_to}: {padded_m}"
 
 
+def _check_sglang_available():
+    """Check if sgl_kernel is available."""
+    try:
+        from sgl_kernel import moe_fused_gate, prepare_moe_input
+
+        return True
+    except Exception:
+        return False
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")
+@pytest.mark.parametrize("seq_len", [4, 16, 64, 256])
+def test_sglang_routing_vs_reference(seq_len):
+    """Compare moe_routing_sglang output against Python reference.
+
+    Verifies that:
+    1. Same experts are selected per token
+    2. Routing weights match
+    3. Permutation roundtrip is valid
+    4. masked_m / m_indptr are consistent
+    """
+    if not _check_sglang_available():
+        pytest.skip("sgl_kernel not available")
+    if not _check_routing_available():
+        pytest.skip("Fused routing kernel not available")
+
+    from flashinfer.utils import get_compute_capability
+
+    cc = get_compute_capability(torch.device("cuda"))
+    if cc[0] not in [8, 9, 10, 12]:
+        pytest.skip(f"Unsupported compute capability {cc}")
+
+    device = "cuda"
+    torch.manual_seed(42)
+
+    E_global = 256
+    E_local = 32
+    top_k = 8
+    n_group = 8
+    topk_group = 4
+    local_expert_offset = 0
+    routed_scaling_factor = 2.5
+
+    routing_logits = torch.randn(seq_len, E_global, dtype=torch.float32, device=device)
+    routing_bias = torch.randn(E_global, dtype=torch.bfloat16, device=device)
+
+    # Run sgl_kernel routing
+    sglang_result = moe_routing_sglang(
+        routing_logits,
+        routing_bias,
+        num_local_experts=E_local,
+        local_expert_offset=local_expert_offset,
+        n_group=n_group,
+        topk_group=topk_group,
+        top_k=top_k,
+        routed_scaling_factor=routed_scaling_factor,
+    )
+
+    # Run reference
+    ref_result = moe_routing_reference(
+        routing_logits,
+        routing_bias,
+        num_local_experts=E_local,
+        local_expert_offset=local_expert_offset,
+        n_group=n_group,
+        topk_group=topk_group,
+        top_k=top_k,
+        routed_scaling_factor=routed_scaling_factor,
+    )
+
+    # Compare expert selection (sort within top_k since order may differ)
+    sglang_sorted, _ = sglang_result.topk_indices.sort(dim=1)
+    ref_sorted, _ = ref_result.topk_indices.sort(dim=1)
+    assert torch.equal(sglang_sorted, ref_sorted), (
+        f"Expert selection mismatch:\nsglang={sglang_sorted}\nref={ref_sorted}"
+    )
+
+    # Compare weights
+    for t in range(seq_len):
+        for k in range(top_k):
+            expert_id = ref_result.topk_indices[t, k].item()
+            sglang_k = (sglang_result.topk_indices[t] == expert_id).nonzero()
+            assert sglang_k.numel() > 0
+            sglang_weight = sglang_result.topk_values[t, sglang_k[0, 0]].item()
+            ref_weight = ref_result.topk_values[t, k].item()
+            assert abs(sglang_weight - ref_weight) < 1e-3, (
+                f"Weight mismatch for token {t}, expert {expert_id}: "
+                f"sglang={sglang_weight:.6f}, ref={ref_weight:.6f}"
+            )
+
+    # Compare total local tokens
+    assert sglang_result.masked_m.sum() == ref_result.masked_m.sum(), (
+        f"Total local token count mismatch: "
+        f"sglang={sglang_result.masked_m.sum().item()}, "
+        f"ref={ref_result.masked_m.sum().item()}"
+    )
+
+    # Compare per-expert token counts
+    assert torch.equal(sglang_result.masked_m, ref_result.masked_m), (
+        f"masked_m mismatch:\nsglang={sglang_result.masked_m}\nref={ref_result.masked_m}"
+    )
+
+    # Verify permutation roundtrip
+    local_end = local_expert_offset + E_local
+    exp_to_perm = sglang_result.expanded_idx_to_permuted_idx.cpu()
+    perm_to_tok = sglang_result.permuted_idx_to_token_idx.cpu()
+    topk_idx = sglang_result.topk_indices.cpu()
+
+    for idx in range(seq_len * top_k):
+        perm_idx = exp_to_perm[idx].item()
+        global_e = topk_idx[idx // top_k, idx % top_k].item()
+        is_local = local_expert_offset <= global_e < local_end
+
+        if is_local:
+            assert perm_idx >= 0, f"Local expert entry {idx} has perm_idx={perm_idx}"
+            mapped_token = perm_to_tok[perm_idx].item()
+            expected_token = idx // top_k
+            assert mapped_token == expected_token, (
+                f"Roundtrip failed at idx={idx}: perm_idx={perm_idx}, "
+                f"mapped_token={mapped_token}, expected={expected_token}"
+            )
+        else:
+            assert perm_idx == -1, (
+                f"Non-local expert entry {idx} (expert={global_e}) has perm_idx={perm_idx}"
+            )
+
+    # m_indptr consistency
+    assert sglang_result.m_indptr[-1].item() == sglang_result.max_padded_tokens
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")
+@pytest.mark.parametrize("seq_len", [4, 16, 64])
+def test_sglang_vs_deepseek_routing(seq_len):
+    """Compare moe_routing_sglang vs moe_routing_deepseek (both use CUDA kernels).
+
+    Both should select the same experts with the same weights.
+    Permutation index layout may differ (sgl_kernel vs vectorized PyTorch),
+    but the logical mapping should be equivalent.
+    """
+    if not _check_sglang_available():
+        pytest.skip("sgl_kernel not available")
+    if not _check_routing_available():
+        pytest.skip("Fused routing kernel not available")
+
+    from flashinfer.utils import get_compute_capability
+
+    cc = get_compute_capability(torch.device("cuda"))
+    if cc[0] not in [8, 9, 10, 12]:
+        pytest.skip(f"Unsupported compute capability {cc}")
+
+    device = "cuda"
+    torch.manual_seed(42)
+
+    E_global = 256
+    E_local = 32
+    top_k = 8
+    local_expert_offset = 0
+    routed_scaling_factor = 2.5
+
+    routing_logits = torch.randn(seq_len, E_global, dtype=torch.float32, device=device)
+    routing_bias = torch.randn(E_global, dtype=torch.bfloat16, device=device)
+
+    sglang_result = moe_routing_sglang(
+        routing_logits,
+        routing_bias,
+        num_local_experts=E_local,
+        local_expert_offset=local_expert_offset,
+        top_k=top_k,
+        routed_scaling_factor=routed_scaling_factor,
+    )
+
+    deepseek_result = moe_routing_deepseek(
+        routing_logits,
+        routing_bias,
+        num_local_experts=E_local,
+        local_expert_offset=local_expert_offset,
+        top_k=top_k,
+        routed_scaling_factor=routed_scaling_factor,
+    )
+
+    # Same experts selected
+    sg_sorted, _ = sglang_result.topk_indices.sort(dim=1)
+    ds_sorted, _ = deepseek_result.topk_indices.sort(dim=1)
+    assert torch.equal(sg_sorted, ds_sorted), "Expert selection mismatch"
+
+    # Same per-expert token counts
+    assert torch.equal(sglang_result.masked_m, deepseek_result.masked_m), (
+        f"masked_m mismatch:\nsglang={sglang_result.masked_m}\n"
+        f"deepseek={deepseek_result.masked_m}"
+    )
+
+    # Same total padded tokens (sglang doesn't pad, deepseek pad_to=1 by default)
+    assert sglang_result.max_padded_tokens == deepseek_result.max_padded_tokens
+
+
 if __name__ == "__main__":
     test_routing_reference_properties(16, 8, 4, 8, 256)
     print("test_routing_reference_properties passed")
@@ -296,4 +492,9 @@ if __name__ == "__main__":
     print("test_permutation_roundtrip passed")
     test_kernel_permutation_roundtrip(16, 4)
     print("test_kernel_permutation_roundtrip passed")
+    if _check_sglang_available():
+        test_sglang_routing_vs_reference(16)
+        print("test_sglang_routing_vs_reference passed")
+        test_sglang_vs_deepseek_routing(16)
+        print("test_sglang_vs_deepseek_routing passed")
     print("All routing tests passed!")
