@@ -54,8 +54,11 @@ def test_v2_vs_v1(seq_len):
     BLOCK = 128
 
     # Generate inputs
+    # DeepSeek routing uses sigmoid + group selection, so we need to dominate
+    # both the group scores and the global top-k selection.
     routing_logits = torch.randn(seq_len, E_GLOBAL, dtype=torch.float32, device=device)
-    routing_logits[:, :E_LOCAL] += 20.0  # bias toward local experts
+    routing_logits[:, :E_LOCAL] += 10.0
+    routing_logits[:, E_LOCAL:] -= 10.0
     routing_bias = torch.randn(E_GLOBAL, dtype=torch.bfloat16, device=device)
     hidden_states = torch.randn(seq_len, H, device=device).to(torch.float8_e4m3fn)
     hs_scale = (
@@ -152,7 +155,8 @@ def test_v2_small_batch():
     BLOCK = 128
 
     routing_logits = torch.randn(1, E_GLOBAL, dtype=torch.float32, device=device)
-    routing_logits[:, :E_LOCAL] += 20.0
+    routing_logits[:, :E_LOCAL] += 10.0
+    routing_logits[:, E_LOCAL:] -= 10.0
     routing_bias = torch.randn(E_GLOBAL, dtype=torch.bfloat16, device=device)
     hidden_states = torch.randn(1, H, device=device).to(torch.float8_e4m3fn)
     hs_scale = (
