@@ -122,28 +122,17 @@ def bench_cupti(fn, warmup=5, iters=20):
 
 
 def run_benchmarks(seq_lens, use_cupti=False):
-    from flashinfer.cute_dsl.moe_pipeline import cutedsl_fp8_moe
+    from flashinfer.cute_dsl.moe_pipeline_v2 import cutedsl_fp8_moe_v2
     from flashinfer.cute_dsl.moe_pipeline_v3 import cutedsl_fp8_moe_v3
-
-    try:
-        from flashinfer.cute_dsl.moe_pipeline_v2 import cutedsl_fp8_moe_v2
-        has_v2 = True
-    except ImportError:
-        has_v2 = False
 
     bench_fn = bench_cupti if use_cupti else bench_cuda_events
 
     print("=" * 80)
-    print("CuTeDSL MoE Pipeline Benchmark: v3 (flat) vs v1 (batched)")
-    if has_v2:
-        print("  Also comparing v2 (vectorized batched)")
+    print("CuTeDSL MoE Pipeline Benchmark: v3 (flat) vs v2 (vectorized batched)")
     print(f"  Timing: {'CUPTI' if use_cupti else 'CUDA events'}")
     print("=" * 80)
 
-    header = f"{'seq_len':>8} | {'v1 (ms)':>10} | "
-    if has_v2:
-        header += f"{'v2 (ms)':>10} | "
-    header += f"{'v3 (ms)':>10} | {'v3/v1':>8} | {'cos_sim':>8}"
+    header = f"{'seq_len':>8} | {'v2 (ms)':>10} | {'v3 (ms)':>10} | {'v3/v2':>8} | {'cos_sim':>8}"
     print(header)
     print("-" * len(header))
 
@@ -155,8 +144,8 @@ def run_benchmarks(seq_lens, use_cupti=False):
             g1w, g1ws, g2w, g2ws, common_kwargs,
         ) = _make_inputs(seq_len)
 
-        def run_v1():
-            return cutedsl_fp8_moe(
+        def run_v2():
+            return cutedsl_fp8_moe_v2(
                 routing_logits, routing_bias, hidden_states, hs_scale,
                 g1w, g1ws, g2w, g2ws, **common_kwargs,
             )
@@ -167,40 +156,26 @@ def run_benchmarks(seq_lens, use_cupti=False):
                 g1w, g1ws, g2w, g2ws, **common_kwargs,
             )
 
-        # Correctness check
-        v1_out = run_v1()
+        # Correctness check (v3 vs v2)
+        v2_out = run_v2()
         v3_out = run_v3()
         cos_sim = torch.nn.functional.cosine_similarity(
-            v1_out.float().flatten(), v3_out.float().flatten(), dim=0
+            v2_out.float().flatten(), v3_out.float().flatten(), dim=0
         ).item()
 
-        # Benchmark v1
-        v1_med, v1_mean, v1_min, v1_max = bench_fn(run_v1)
-
         # Benchmark v2
-        v2_med = None
-        if has_v2:
-            def run_v2():
-                return cutedsl_fp8_moe_v2(
-                    routing_logits, routing_bias, hidden_states, hs_scale,
-                    g1w, g1ws, g2w, g2ws, **common_kwargs,
-                )
-            v2_med, _, _, _ = bench_fn(run_v2)
+        v2_med, v2_mean, v2_min, v2_max = bench_fn(run_v2)
 
         # Benchmark v3
         v3_med, v3_mean, v3_min, v3_max = bench_fn(run_v3)
 
-        ratio = v3_med / v1_med if v1_med > 0 else float('inf')
+        ratio = v3_med / v2_med if v2_med > 0 else float('inf')
 
-        row = f"{seq_len:>8} | {v1_med:>10.3f} | "
-        if has_v2:
-            row += f"{v2_med:>10.3f} | " if v2_med else f"{'N/A':>10} | "
-        row += f"{v3_med:>10.3f} | {ratio:>8.3f} | {cos_sim:>8.4f}"
+        row = f"{seq_len:>8} | {v2_med:>10.3f} | {v3_med:>10.3f} | {ratio:>8.3f} | {cos_sim:>8.4f}"
         print(row)
 
         results.append({
             "seq_len": seq_len,
-            "v1_ms": v1_med,
             "v2_ms": v2_med,
             "v3_ms": v3_med,
             "ratio": ratio,
@@ -208,7 +183,7 @@ def run_benchmarks(seq_lens, use_cupti=False):
         })
 
     print("-" * len(header))
-    print("\nv3/v1 < 1.0 means v3 is faster")
+    print("\nv3/v2 < 1.0 means v3 is faster")
     return results
 
 
