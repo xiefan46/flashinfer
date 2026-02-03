@@ -178,6 +178,7 @@ def _get_compiled_finalize_kernel(H: int, top_k: int):
 
     sym_T = cute.sym_int()
     sym_padded = cute.sym_int()
+    sym_T_topk = cute.sym_int()  # T * top_k (separate sym to avoid SymInt * int)
     H_half = H // 2
 
     # gemm2_out: [padded, H//2] as Uint32 (bfloat16x2 pairs)
@@ -186,15 +187,15 @@ def _get_compiled_finalize_kernel(H: int, top_k: int):
     )
     # expert_weights: [T*top_k] as Float32 (flattened)
     expert_weights_fake = cute.runtime.make_fake_compact_tensor(
-        cutlass.Float32, (sym_T * top_k,), stride_order=(0,), assumed_align=4
+        cutlass.Float32, (sym_T_topk,), stride_order=(0,), assumed_align=4
     )
     # topk_indices: [T*top_k] as Int32 (flattened, converted from i64)
     topk_indices_fake = cute.runtime.make_fake_compact_tensor(
-        cutlass.Int32, (sym_T * top_k,), stride_order=(0,), assumed_align=4
+        cutlass.Int32, (sym_T_topk,), stride_order=(0,), assumed_align=4
     )
     # expanded_idx_to_permuted_idx: [T*top_k] as Int32
     expanded_perm_fake = cute.runtime.make_fake_compact_tensor(
-        cutlass.Int32, (sym_T * top_k,), stride_order=(0,), assumed_align=4
+        cutlass.Int32, (sym_T_topk,), stride_order=(0,), assumed_align=4
     )
     # output: [T, H//2] as Uint32 (bfloat16x2 pairs)
     output_fake = cute.runtime.make_fake_compact_tensor(
