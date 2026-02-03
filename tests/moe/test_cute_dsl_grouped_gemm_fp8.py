@@ -9,6 +9,9 @@ from flashinfer.cute_dsl.moe_grouped_gemm_fp8 import (
     moe_gemm2_fp8,
     _quantize_output_fp8,
 )
+from flashinfer.cute_dsl.moe_grouped_gemm_cutedsl import (
+    moe_grouped_gemm_fp8_cutedsl,
+)
 
 
 def _check_sm100():
@@ -150,8 +153,61 @@ def test_quantize_output_fp8():
     print(f"PASSED (cos_sim={cos_sim:.4f})", flush=True)
 
 
+@pytest.mark.skipif(not _check_sm100(), reason="Requires SM100+")
+@pytest.mark.parametrize("N,K", [(256, 256), (256, 512)])
+@pytest.mark.parametrize("E", [2, 4])
+@pytest.mark.parametrize("m_per_expert", [128])
+def test_cutedsl_grouped_gemm_fp8_direct(N, K, E, m_per_expert):
+    """Test CuTeDSL grouped GEMM kernel directly (bypassing wrapper)."""
+    print(f"\n  [CuTeDSL GEMM] N={N}, K={K}, E={E}, m={m_per_expert} ... ", end="", flush=True)
+    device = "cuda"
+    torch.manual_seed(42)
+
+    total_M = E * m_per_expert
+
+    # Generate random data
+    a_bf16 = torch.randn(total_M, K, dtype=torch.bfloat16, device=device)
+    b_bf16 = torch.randn(E, N, K, dtype=torch.bfloat16, device=device)
+
+    a_fp8, a_scales = _fp8_block_quant_1d(a_bf16)
+    b_fp8, b_scales = _fp8_block_quant_2d(b_bf16)
+
+    # MN-major scales
+    a_scale_mn = a_scales.t().contiguous()  # [K//128, total_M]
+    # b_scales is [E, N//128, K//128]
+
+    # masked_m: per-expert token counts
+    masked_m = torch.full((E,), m_per_expert, dtype=torch.int32, device=device)
+
+    # Run CuTeDSL grouped GEMM directly
+    out = moe_grouped_gemm_fp8_cutedsl(
+        a_fp8, b_fp8, a_scale_mn, b_scales, masked_m, out_dtype=torch.bfloat16
+    )
+
+    assert out.shape == (total_M, N), f"Shape mismatch: {out.shape} vs {(total_M, N)}"
+    assert out.dtype == torch.bfloat16
+
+    # Reference: dequant(a) @ dequant(b)^T per expert
+    a_dequant = a_fp8.to(torch.float32) * a_scales.repeat_interleave(128, dim=1)
+
+    for e in range(E):
+        start = e * m_per_expert
+        end = (e + 1) * m_per_expert
+        b_e_dequant = b_fp8[e].to(torch.float32) * b_scales[e].repeat_interleave(128, dim=0).repeat_interleave(128, dim=1)
+        ref_e = a_dequant[start:end] @ b_e_dequant.t()
+        out_e = out[start:end].to(torch.float32)
+
+        cos_sim = torch.nn.functional.cosine_similarity(
+            ref_e.flatten(), out_e.flatten(), dim=0
+        )
+        assert cos_sim > 0.95, f"Expert {e}: cosine similarity {cos_sim:.4f} too low"
+    print(f"PASSED (cos_sim={cos_sim:.4f})", flush=True)
+
+
 if __name__ == "__main__":
     if _check_sm100():
+        test_cutedsl_grouped_gemm_fp8_direct(256, 256, 2, 128)
+        print("test_cutedsl_grouped_gemm_fp8_direct passed")
         test_grouped_gemm_fp8_bf16_output(4096, 7168, 4, 64)
         print("test_grouped_gemm_fp8_bf16_output passed")
         test_quantize_output_fp8()

@@ -37,6 +37,12 @@ import torch
 
 from ..api_logging import flashinfer_api
 from ..gemm import group_gemm_fp8_nt_groupwise
+from .moe_grouped_gemm_cutedsl import moe_grouped_gemm_fp8_cutedsl
+
+
+def _m_indptr_to_masked_m(m_indptr: torch.Tensor) -> torch.Tensor:
+    """Convert m_indptr [E+1] to masked_m [E] (per-expert token counts)."""
+    return (m_indptr[1:] - m_indptr[:-1]).to(torch.int32)
 
 
 def _pad_m_indptr(m_indptr: torch.Tensor, pad_to: int = 4) -> torch.Tensor:
@@ -118,19 +124,19 @@ def _run_gemm(
     out_dtype: torch.dtype,
     out: Optional[torch.Tensor],
 ) -> torch.Tensor:
-    """Internal GEMM dispatch."""
+    """Internal GEMM dispatch using CuTeDSL kernel."""
     total_M = a.shape[0]
     N = b.shape[1]
+
+    masked_m = _m_indptr_to_masked_m(m_indptr)
 
     if out is None:
         out = torch.empty(total_M, N, dtype=out_dtype, device=a.device)
 
     if out_dtype == torch.float8_e4m3fn:
         # For FP8 output (GEMM1), run GEMM to BF16 then quantize
-        # This is a temporary approach — CuTeDSL kernel will fuse this
-        bf16_out = group_gemm_fp8_nt_groupwise(
-            a, b, a_scale, b_scale, m_indptr,
-            scale_major_mode="MN",
+        bf16_out = moe_grouped_gemm_fp8_cutedsl(
+            a, b, a_scale, b_scale, masked_m,
             out_dtype=torch.bfloat16,
         )
         # Quantize BF16 output to FP8 with per-block scales
@@ -138,9 +144,8 @@ def _run_gemm(
         return out_fp8, out_scale
 
     # Standard BF16 output path
-    out = group_gemm_fp8_nt_groupwise(
-        a, b, a_scale, b_scale, m_indptr,
-        scale_major_mode="MN",
+    out = moe_grouped_gemm_fp8_cutedsl(
+        a, b, a_scale, b_scale, masked_m,
         out_dtype=out_dtype,
         out=out,
     )
@@ -230,14 +235,16 @@ def moe_gemm1_fp8(
     # gemm1_weights_scale is already [E, 2I//128, H//128] which is [E, N//128, K//128]
     b_scale_mn = gemm1_weights_scale
 
-    # Run grouped GEMM -> BF16
-    bf16_out = group_gemm_fp8_nt_groupwise(
+    # Convert m_indptr to masked_m for CuTeDSL kernel
+    masked_m = _m_indptr_to_masked_m(m_indptr)
+
+    # Run grouped GEMM -> BF16 via CuTeDSL
+    bf16_out = moe_grouped_gemm_fp8_cutedsl(
         a_gathered,
         gemm1_weights,
         a_scale_gathered,
         b_scale_mn,
-        m_indptr,
-        scale_major_mode="MN",
+        masked_m,
         out_dtype=torch.bfloat16,
     )
 
@@ -279,13 +286,15 @@ def moe_gemm2_fp8(
     Returns:
         gemm2_out: [max_padded, H] bfloat16
     """
-    gemm2_out = group_gemm_fp8_nt_groupwise(
+    # Convert m_indptr to masked_m for CuTeDSL kernel
+    masked_m = _m_indptr_to_masked_m(m_indptr)
+
+    gemm2_out = moe_grouped_gemm_fp8_cutedsl(
         act_out,
         gemm2_weights,
         act_scale,
         gemm2_weights_scale,
-        m_indptr,
-        scale_major_mode="MN",
+        masked_m,
         out_dtype=torch.bfloat16,
         out=gemm2_out,
     )
