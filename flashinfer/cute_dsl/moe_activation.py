@@ -277,6 +277,10 @@ def moe_swiglu_fp8_requant(
     if act_scale is None:
         act_scale = torch.empty(num_out_blocks, padded, dtype=torch.float32, device=device)
 
+    # Early exit: no rows to process
+    if padded == 0:
+        return act_out, act_scale
+
     # Get cached compiled kernel and run
     kernel = _get_compiled_swiglu_kernel(I)
     kernel(gemm1_out, gemm1_scale, act_out, act_scale, padded)
