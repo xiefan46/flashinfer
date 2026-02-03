@@ -1182,16 +1182,17 @@ def moe_grouped_gemm_fp8_cutedsl(
     assert masked_m.shape[0] == E
 
     device = a.device
-    max_M = int(masked_m.max().item())
-    assert max_M % 128 == 0, f"max_M must be multiple of 128, got {max_M}"
+    max_M_raw = int(masked_m.max().item())
+    # Pad max_M up to next multiple of 128 (MMA tile M dimension).
+    # MaskedScheduler uses masked_m to skip padded rows.
+    max_M = ((max_M_raw + 127) // 128) * 128
 
-    # Check: for uniform padding (typical in MoE), total_M = E * max_M
-    # and we can reshape without copying
-    if total_M == E * max_M:
-        # Direct reshape: [total_M, K] → [E, max_M, K]
+    # Reshape [total_M, K] → [E, max_M, K] with padding
+    if total_M == E * max_M_raw and max_M == max_M_raw:
+        # Direct reshape: no padding needed
         a_batched = a.view(E, max_M, K)
     else:
-        # Non-uniform: pad each expert's rows to max_M
+        # Pad each expert's rows to max_M
         a_batched = torch.zeros(E, max_M, K, dtype=a.dtype, device=device)
         offset = 0
         for e in range(E):
@@ -1205,8 +1206,8 @@ def moe_grouped_gemm_fp8_cutedsl(
     # Output: [E, max_M, N]
     c_batched = torch.empty(E, max_M, N, dtype=out_dtype, device=device)
 
-    # a_scale: [K//128, total_M] — may need padding if non-uniform
-    if total_M == E * max_M:
+    # a_scale: [K//128, total_M] → [K//128, E*max_M] with padding
+    if total_M == E * max_M_raw and max_M == max_M_raw:
         a_scale_flat = a_scale  # already correct
     else:
         a_scale_flat = torch.zeros(
