@@ -149,7 +149,8 @@ class MoEFinalizeKernel:
                         for c in cutlass.range_constexpr(COLS_PER_THREAD):
                             col = tid + c * BLOCK
                             if col < H_half:
-                                packed = mGemm2Out[perm_idx, col]
+                                # Tensor is Int32; cast to Uint32 for PTX bit ops
+                                packed = Uint32(mGemm2Out[perm_idx, col])
                                 lo_bf16 = unpack_bf16_lo(packed)
                                 hi_bf16 = unpack_bf16_hi(packed)
                                 lo_f32 = cvt_bf16_to_f32(lo_bf16)
@@ -163,7 +164,8 @@ class MoEFinalizeKernel:
             if col < H_half:
                 out_lo = cvt_f32_to_bf16(acc_lo[c])
                 out_hi = cvt_f32_to_bf16(acc_hi[c])
-                mOutput[t, col] = pack_two_bf16(out_lo, out_hi)
+                # Cast Uint32 back to Int32 to match tensor dtype
+                mOutput[t, col] = Int32(pack_two_bf16(out_lo, out_hi))
 
 
 # =============================================================================
@@ -181,9 +183,9 @@ def _get_compiled_finalize_kernel(H: int, top_k: int):
     sym_T_topk = cute.sym_int()  # T * top_k (separate sym to avoid SymInt * int)
     H_half = H // 2
 
-    # gemm2_out: [padded, H//2] as Uint32 (bfloat16x2 pairs)
+    # gemm2_out: [padded, H//2] as Int32 (bfloat16x2 pairs, viewed from bf16)
     gemm2_out_fake = cute.runtime.make_fake_compact_tensor(
-        cutlass.Uint32, (sym_padded, H_half), stride_order=(1, 0), assumed_align=128
+        cutlass.Int32, (sym_padded, H_half), stride_order=(1, 0), assumed_align=128
     )
     # expert_weights: [T*top_k] as Float32 (flattened)
     expert_weights_fake = cute.runtime.make_fake_compact_tensor(
@@ -197,9 +199,9 @@ def _get_compiled_finalize_kernel(H: int, top_k: int):
     expanded_perm_fake = cute.runtime.make_fake_compact_tensor(
         cutlass.Int32, (sym_T_topk,), stride_order=(0,), assumed_align=4
     )
-    # output: [T, H//2] as Uint32 (bfloat16x2 pairs)
+    # output: [T, H//2] as Int32 (bfloat16x2 pairs, viewed from bf16)
     output_fake = cute.runtime.make_fake_compact_tensor(
-        cutlass.Uint32, (sym_T, H_half), stride_order=(1, 0), assumed_align=128
+        cutlass.Int32, (sym_T, H_half), stride_order=(1, 0), assumed_align=128
     )
 
     stream_fake = cute.runtime.make_fake_stream(use_tvm_ffi_env_stream=True)
