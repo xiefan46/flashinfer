@@ -1183,6 +1183,13 @@ def moe_grouped_gemm_fp8_cutedsl(
 
     device = a.device
     max_M_raw = int(masked_m.max().item())
+
+    # Early exit: no tokens routed to any expert
+    if max_M_raw == 0:
+        if out is None:
+            out = torch.empty(0, N, dtype=out_dtype, device=device)
+        return out
+
     # Pad max_M up to next multiple of 128 (MMA tile M dimension).
     # MaskedScheduler uses masked_m to skip padded rows.
     max_M = ((max_M_raw + 127) // 128) * 128
